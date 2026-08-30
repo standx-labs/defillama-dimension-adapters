@@ -1,5 +1,14 @@
 name: test-adapter
 on: [pull_request]
+
+# Least privilege for GITHUB_TOKEN. The job only needs to read the repository,
+# plus pull-request write access so commentResult.js can report the adapter
+# output. For pull requests opened from a fork GitHub keeps the token read-only
+# regardless of this block, which commentResult.js handles gracefully.
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -31,7 +40,21 @@ jobs:
         run: pnpm install
 
       - name: Run changes files through test script
+        env:
+          # Attacker-controlled pull request data (changed file names, repository
+          # and pull request metadata) is passed through the environment instead
+          # of being interpolated into the script body. A `${{ ... }}` expansion
+          # inside `run:` is a textual substitution performed before the shell
+          # starts, so a crafted file name could otherwise inject commands.
+          MODIFIED: ${{ steps.file_changes.outputs.files_modified }}
+          ADDED: ${{ steps.file_changes.outputs.files_added }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -o pipefail
+
           # Store the current commit hash in a variable
           current_commit=$(git rev-parse HEAD)
 
@@ -41,11 +64,9 @@ jobs:
           # Checkout back to the original commit
           git checkout $current_commit
 
-          RUN_FILES=$(
-            MODIFIED=${{ steps.file_changes.outputs.files_modified}} \
-            ADDED=${{ steps.file_changes.outputs.files_added}} \
-            node ${{ github.workspace }}/.github/workflows/getFileList.js
-          )
+          # MODIFIED and ADDED are already exported to getFileList.js by the
+          # step-level `env` block above.
+          RUN_FILES=$(node "$GITHUB_WORKSPACE/.github/workflows/getFileList.js")
 
           if [ "$RUN_FILES" = "[]" ]; then
             echo "No adapter files were modified"
@@ -54,17 +75,32 @@ jobs:
 
           list=$(echo $RUN_FILES | tr  -d '"[]' | tr "," "\n")
 
+          # Derived from the workspace instead of a hardcoded
+          # /home/runner/work/<repo>/<repo> path, which does not exist in a fork
+          # whose repository name differs from the upstream one.
+          output_file="$GITHUB_WORKSPACE/output.txt"
+          failed=0
+
           for i in ${list}
           do
             {
               IFS='@' read -r -a array <<< "$i"
-              npm run test ${array[0]} ${array[1]} 2>&1 | tee output.txt
-              node ${{ github.workspace }}/.github/workflows/commentResult.js /home/runner/work/dimension-adapters/dimension-adapters/output.txt "${{ github.repository_owner }}" "${{ github.event.repository.name }}" "${{ github.event.number }}" ${i}
-              if grep -q "\-\-\-\- ERROR \-\-\-\-" output.txt; then
-                exit 1;
-              fi
+              npm run test "${array[0]}" "${array[1]}" 2>&1 | tee "$output_file"
             } || {
-              echo -n $i
-              echo ' doesnt run'
+              echo "$i doesnt run"
+              failed=1
             }
+
+            # Commenting must not decide the outcome of the job: a failure to
+            # post (for example a read-only token on a fork pull request) used to
+            # skip the error check below and let a broken adapter pass CI.
+            node "$GITHUB_WORKSPACE/.github/workflows/commentResult.js" \
+              "$output_file" "$REPO_OWNER" "$REPO_NAME" "$PR_NUMBER" "$i" || true
+
+            if grep -q -- "---- ERROR ----" "$output_file"; then
+              echo "Adapter $i reported an error"
+              failed=1
+            fi
           done
+
+          exit $failed
